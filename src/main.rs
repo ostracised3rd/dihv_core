@@ -1,5 +1,9 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy::math::Vec3Swizzles;
+use enemy::EnemyPlugin;
+use std::collections::HashSet;
+use bevy::sprite::collide_aabb::collide;
 use player::PlayerPlugin;
 use components::{
 	Enemy, Explosion, ExplosionTimer, ExplosionToSpawn, FromEnemy, FromPlayer, Laser, Movable,
@@ -8,6 +12,7 @@ use components::{
 
 mod components;
 mod player;
+mod enemy;
 
 // region:    --- Asset Constants
 const PLAYER_SPRITE: &str = "player_a_01.png";
@@ -87,8 +92,13 @@ fn main() {
 			..Default::default()
 		}))
 		.add_plugins(PlayerPlugin)
+		.add_plugins(EnemyPlugin)
 		.add_systems(Startup, setup_system)
 		.add_systems(Update, movable_system)
+		.add_systems(Update, player_laser_hit_enemy_system)
+		.add_systems(Update, explosion_to_spawn_system)
+		.add_systems(Update, explosion_animation_system)
+		.add_systems(Update, enemy_laser_hit_player_system)
 		.run();
 }
 
@@ -156,6 +166,141 @@ fn movable_system(
 				|| translation.x < -win_size.w / 2. - MARGIN
 			{
 				commands.entity(entity).despawn();
+			}
+		}
+	}
+}
+
+
+#[allow(clippy::type_complexity)] // for the Query types.
+fn player_laser_hit_enemy_system(
+	mut commands: Commands,
+	mut enemy_count: ResMut<EnemyCount>,
+	laser_query: Query<(Entity, &Transform, &SpriteSize), (With<Laser>, With<FromPlayer>)>,
+	enemy_query: Query<(Entity, &Transform, &SpriteSize), With<Enemy>>,
+) {
+	let mut despawned_entities: HashSet<Entity> = HashSet::new();
+
+	// iterate through the lasers
+	for (laser_entity, laser_tf, laser_size) in laser_query.iter() {
+		if despawned_entities.contains(&laser_entity) {
+			continue;
+		}
+
+		let laser_scale = laser_tf.scale.xy();
+
+		// iterate through the enemies
+		for (enemy_entity, enemy_tf, enemy_size) in enemy_query.iter() {
+			if despawned_entities.contains(&enemy_entity)
+				|| despawned_entities.contains(&laser_entity)
+			{
+				continue;
+			}
+
+			let enemy_scale = enemy_tf.scale.xy();
+
+			// determine if collision
+			let collision = collide(
+				laser_tf.translation,
+				laser_size.0 * laser_scale,
+				enemy_tf.translation,
+				enemy_size.0 * enemy_scale,
+			);
+
+			// perform collision
+			if collision.is_some() {
+				// remove the enemy
+				commands.entity(enemy_entity).despawn();
+				despawned_entities.insert(enemy_entity);
+				enemy_count.0 -= 1;
+
+				// remove the laser
+				commands.entity(laser_entity).despawn();
+				despawned_entities.insert(laser_entity);
+
+				// spawn the explosionToSpawn
+				commands.spawn(ExplosionToSpawn(enemy_tf.translation));
+			}
+		}
+	}
+}
+
+
+fn explosion_to_spawn_system(
+	mut commands: Commands,
+	game_textures: Res<GameTextures>,
+	query: Query<(Entity, &ExplosionToSpawn)>,
+) {
+	for (explosion_spawn_entity, explosion_to_spawn) in query.iter() {
+		// spawn the explosion sprite
+		commands
+			.spawn(SpriteSheetBundle {
+				texture_atlas: game_textures.explosion.clone(),
+				transform: Transform {
+					translation: explosion_to_spawn.0,
+					..Default::default()
+				},
+				..Default::default()
+			})
+			.insert(Explosion)
+			.insert(ExplosionTimer::default());
+
+		// despawn the explosionToSpawn
+		commands.entity(explosion_spawn_entity).despawn();
+	}
+}
+
+fn explosion_animation_system(
+	mut commands: Commands,
+	time: Res<Time>,
+	mut query: Query<(Entity, &mut ExplosionTimer, &mut TextureAtlasSprite), With<Explosion>>,
+) {
+	for (entity, mut timer, mut sprite) in &mut query {
+		timer.0.tick(time.delta());
+		if timer.0.finished() {
+			sprite.index += 1; // move to next sprite cell
+			if sprite.index >= EXPLOSION_LEN {
+				commands.entity(entity).despawn();
+			}
+		}
+	}
+}
+
+#[allow(clippy::type_complexity)] // for the Query types.
+fn enemy_laser_hit_player_system(
+	mut commands: Commands,
+	mut player_state: ResMut<PlayerState>,
+	time: Res<Time>,
+	laser_query: Query<(Entity, &Transform, &SpriteSize), (With<Laser>, With<FromEnemy>)>,
+	player_query: Query<(Entity, &Transform, &SpriteSize), With<Player>>,
+) {
+	if let Ok((player_entity, player_tf, player_size)) = player_query.get_single() {
+		let player_scale = player_tf.scale.xy();
+
+		for (laser_entity, laser_tf, laser_size) in laser_query.iter() {
+			let laser_scale = laser_tf.scale.xy();
+
+			// determine if collision
+			let collision = collide(
+				laser_tf.translation,
+				laser_size.0 * laser_scale,
+				player_tf.translation,
+				player_size.0 * player_scale,
+			);
+
+			// perform the collision
+			if collision.is_some() {
+				// remove the player
+				commands.entity(player_entity).despawn();
+				player_state.shot(time.elapsed_seconds_f64());
+
+				// remove the laser
+				commands.entity(laser_entity).despawn();
+
+				// spawn the explosionToSpawn
+				commands.spawn(ExplosionToSpawn(player_tf.translation));
+
+				break;
 			}
 		}
 	}
